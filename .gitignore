@@ -1,0 +1,19 @@
+# Datasets (download via README instructions)
+data_files/
+
+# Trained model weights (regenerate via train.py)
+ckpts/*.pt
+ckpts_smoke/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
