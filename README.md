@@ -87,7 +87,50 @@ Top: rotated input. Middle: full encode → decode (the network's own reconstruc
 
 ![cycle grid](ckpts/cycle_grid.png)
 
-## What works, what doesn't
+## Latent dynamics — extrapolating to OOD rotations
+
+The autoencoder above is the foundation. The actual experiment of interest is whether the latent group-action property survives **multi-step rollout under novel actions** — that's the bridge from "structured representation" to "structured world model dynamics".
+
+**Setup.** Generate trajectories `(x_0, a_0, x_1, ..., x_T)` where each `a_t` is a random axis-angle rotation and `x_{t+1} = R(a_t) · x_t`. Train two latent dynamics models on top of the *frozen* encoder/decoder above, then test on action magnitudes never seen at training.
+
+| Model | Pose update | Content update | Params |
+|---|---|---|---|
+| `pure` | `z_p_{t+1} = R(a_t) @ z_p_t` (exact, closed form) | `z_c_{t+1} = z_c_t` (frozen) | **0** |
+| `hybrid` | `R(a_t) @ z_p_t` (exact) | `z_c_t + MLP(z_c_t, a_t)` (learned residual) | ~13K |
+| `baseline` | `MLP(z_c, z_p_flat, a)` predicts both deltas (learned) | same MLP | ~140K |
+
+**Train regime:** `|a| ∈ [0, π/4]`, `T=4` steps, 1500 steps on 400 chairs, ~8 minutes on Jetson.
+**Test regime:** in-distribution `|a| ∈ [0, π/4]` and OOD `|a| ∈ [π/2, π]`, both rolled out for `T=8` steps.
+
+### Pose latent error vs rollout step
+
+![pose error](ckpts/dynamics_pose_err.png)
+
+`pure` and `hybrid` (overlapping) sit *exactly on the encoder's equivariance noise floor* (~0.003 in-dist, ~0.02 OOD, **flat** across rollout step). `baseline` is **3 orders of magnitude worse** at every step in both regimes. The architectural prior gives perfect extrapolation; the learned MLP doesn't.
+
+### Content latent error vs rollout step
+
+![content error](ckpts/dynamics_content_err.png)
+
+This is where the **second insight** appears: `pure` is at ~5e-5 (the encoder's content-invariance noise — content is *defined* not to change under rotation, and `pure` correctly does nothing). `baseline` plateaus at ~10. **`hybrid`'s learned residual MLP actively diverges in OOD**, blowing up to ~100 because the MLP extrapolates badly to action magnitudes outside its training range. Doing nothing beats doing something, because the architecture already knows the correct answer.
+
+### Decoded Chamfer (the misleading metric)
+
+![chamfer](ckpts/dynamics_per_step.png)
+
+If you only looked at decoded Chamfer (which is what most papers report), you would conclude that `baseline` *beats* the principled methods on OOD — `baseline` stays flat at ~0.06 while `hybrid` blows up to ~0.57. **This is wrong.** What's happening is the decoder suffers mean-shape collapse from the autoencoder training: it produces blob-like point clouds that look similar regardless of `z_pose`, so chamfer between any blob and any rotated chair is ~0.06. `baseline`'s strategy of *not actually moving the latent* (it learned approximately the identity) is a cheap win against a decoder that doesn't read its input. The latent metrics above are necessary to see the actual structural property.
+
+### Findings
+
+1. **Architectural inductive bias gives exact OOD extrapolation.** `pure`'s pose error tracks the encoder's equivariance noise floor regardless of rollout step or action magnitude — it never trained on OOD rotations and doesn't need to.
+2. **Learned residuals on top of architectural priors can regress OOD performance.** `hybrid` is structurally identical to `pure` on the pose, but its MLP-residual on the content extrapolates badly and degrades the rollout precisely *outside* the training distribution.
+3. **Standard latent dynamics (no group prior) is wildly off in latent space**, but this is masked by weak decoders. Anyone evaluating world model latents through decoded reconstruction quality is potentially measuring decoder noise instead of dynamics quality.
+
+The publishable claim, in one sentence:
+
+> *Closed-form group-action dynamics in latent space achieves perfect extrapolation to rotation magnitudes outside the training distribution; standard learned latent-dynamics models fail to extrapolate, and decoded reconstruction metrics fail to detect the failure due to decoder mean-shape collapse.*
+
+## What works, what doesn't (autoencoder)
 
 **Works** — the structural goals.
 - Content latent is essentially invariant to rotation.
@@ -95,23 +138,24 @@ Top: rotated input. Middle: full encode → decode (the network's own reconstruc
 - Decoding from `R · z_pose` gives the same reconstruction quality as encoding the rotated input.
 
 **Limitations** — the visual quality.
-- The decoder collapses to a generic point distribution rather than the specific input shape. This is a known failure mode of Chamfer-only point cloud autoencoders (mean-shape collapse).
-- Pose magnitude collapsed: `‖z_p‖_F ≈ 0.32` vs. target `√3`. The equivariance loss out-pulled the norm regularizer. Easy fix: bump `w_norm` from 0.05 → 1.0 next run.
-- Mixed-class training (10 classes share one decoder) blurs the per-class shape detail. Single-class training (chairs only) would give a much cleaner visual demo with the same architecture.
-
-The interesting result here is the structural one — that `R·z_p` works as the latent group action — not the reconstruction visual quality.
+- The decoder collapses to a generic point distribution rather than the specific input shape. This is the same mean-shape collapse that contaminates the dynamics-eval Chamfer metric above.
+- Pose magnitude collapsed: `‖z_p‖_F ≈ 0.32` vs. target `√3`. Easy fix next run: bump `w_norm` from 0.05 → 1.0.
+- Mixed-class training (10 classes share one decoder) blurs per-class detail. Single-class chairs-only would give cleaner visuals — same latent structure.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `data.py` | ModelNet10 loader, `rotation_matrix_yaw`, `random_rotation_matrix_so3`, `rotate_pointcloud`, `sample_pair_batch` |
+| `data.py` | ModelNet10 loader, rotation utilities, `axis_angle_to_matrix`, `sample_trajectory_batch` |
 | `model.py` | Perceiver encoder + decoder, `rotate_pose_matrix`, `chamfer_distance` |
-| `train.py` | Training loop with the 6-term objective above |
-| `eval.py` | Pose-orbit / content-invariance / cycle-reconstruction plots |
+| `dynamics.py` | `PureHybridDynamics`, `HybridDynamics`, `BaselineDynamics` for the rollout experiment |
+| `train.py` | Autoencoder training loop |
+| `train_dynamics.py` | Trains `Hybrid` + `Baseline` on rollouts with frozen encoder/decoder |
+| `eval.py` | Autoencoder pose-orbit / content-invariance / cycle plots |
+| `eval_dynamics.py` | OOD rollout comparison: pose-err / content-err / decoded-chamfer / visual |
 | `visualize_data.py` | Dataset + rotation visualizations |
 | `assets/` | README dataset figures |
-| `ckpts/` | Trained checkpoint + eval figures |
+| `ckpts/` | Trained checkpoints + eval figures |
 
 ## References
 
