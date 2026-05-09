@@ -32,7 +32,8 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    paths = list_modelnet10_paths(split="train")
+    classes = args.classes.split(",") if args.classes else None
+    paths = list_modelnet10_paths(split="train", classes=classes)
     if args.max_samples > 0:
         paths = paths[: args.max_samples]
     dataset = PointCloudDataset(paths, n_points=args.n_points, cache=True)
@@ -102,17 +103,20 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--n-points", type=int, default=529)  # 23*23 grid
+    p.add_argument("--steps", type=int, default=5000)
+    p.add_argument("--batch-size", type=int, default=12)
+    p.add_argument("--n-points", type=int, default=1024)  # 32*32 grid
     p.add_argument("--content-dim", type=int, default=64)
     p.add_argument("--vn-hidden", type=int, default=64)
-    p.add_argument("--dec-hidden", type=int, default=256)
+    p.add_argument("--dec-hidden", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--w-cycle", type=float, default=1.0)
-    p.add_argument("--w-equiv", type=float, default=0.1)  # tiny — should already be ~0 by arch
+    p.add_argument("--w-equiv", type=float, default=0.1)
     p.add_argument("--w-inv", type=float, default=0.1)
-    p.add_argument("--max-samples", type=int, default=800)
+    p.add_argument("--max-samples", type=int, default=0,
+                   help="cap meshes (0 = use all in classes)")
+    p.add_argument("--classes", type=str, default="chair",
+                   help="comma-separated class list, empty = all 10")
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--ckpt-dir", type=str, default="ckpts")
     return p.parse_args()

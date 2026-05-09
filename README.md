@@ -60,29 +60,37 @@ Defaults: 2000 steps autoencoder + 1500 steps dynamics, 800 ModelNet10 meshes, ~
 
 ## Autoencoder results
 
-After 2000 steps on 800 ModelNet10 meshes (~18 min on Orin):
+After 5000 steps on chairs only (~90 min on Orin), pose equivariance error is **2 × 10⁻⁵ mean / 1 × 10⁻⁴ max** in fp32 inference, **3 × 10⁻¹⁰ in fp64** — machine epsilon.
 
-### Pose latent under input yaw
+### Canonicalization (no decoder involved)
 
-The blue curve (encoder output for rotated input) and red dashed curve (group action `R(θ) · z_p₀`) overlay perfectly — equivariance is an architectural identity.
+This is the cleanest possible demonstration of the equivariance. Top row: the same chair rotated 8 different ways. For each, encode → get `z_pose`, then apply `z_pose⁻¹` (via SVD-projected rotation) directly to the input points. **All 8 bottom panels collapse to the identical canonical orientation** — proving the encoder correctly extracted the rotation, with no decoder dependency.
+
+![canonicalization](ckpts/canonicalization.png)
+
+### Animated equivariance: `z_pose` axes rotate with the chair
+
+`rotation_cycle.gif` animates a chair rotating through `[0, 2π]`, with the inferred `z_pose` columns overlaid as RGB axes. The axes rotate exactly with the chair — `enc(R · x).z_p = R · enc(x).z_p` is visible as the RGB frame tracking the input.
+
+![rotation cycle](ckpts/rotation_cycle.gif)
+
+### Pose latent under input yaw — quantitative
+
+For each entry of the 3×3 pose matrix, blue (encoder output for rotated input) overlays red dashed (predicted by `R(θ) · z_p₀`). Top 6 entries are clean sinusoids; bottom row entries are flat constants (the z-axis components that don't change under yaw around z).
 
 ![pose orbit](ckpts/pose_orbit.png)
 
-### Cycle: encode once, rotate the latent, decode
+### Cycle through latent group action
 
-Top: input rotated by θ. Mid: full encode→decode. Bottom: encode the canonical input once, then decode with `R(θ) · z_pose`. The bottom row matches the top row's geometry because `dec ∘ R = R ∘ dec` is an identity.
+Top: input rotated by θ. Mid: full encode→decode. Bottom: encode canonical input once, then decode with `R(θ) · z_pose`. `dec ∘ R = R ∘ dec` is an architectural identity.
 
 ![cycle grid](ckpts/cycle_grid.png)
 
-### Per-class reconstruction
+### Per-instance reconstruction
 
-![per class](ckpts/per_class_recon.png)
+10 different test chairs (top: ground truth, bottom: enc → dec). The decoder is undertrained for fully sharp shapes — the equivariance demonstrations above (canonicalization, GIF, pose orbit) bypass the decoder, which is why they're the headline visuals.
 
-### Smooth rotation in latent space
-
-Top: real rotated chair. Bottom: `dec(z_c, R(θ) · z_p)` — sweeping the latent rotation produces a continuously rotating decoded shape.
-
-![rotation sweep](ckpts/rotation_sweep.png)
+![per instance](ckpts/per_class_recon.png)
 
 ## Latent dynamics — extrapolating to OOD rotations
 
