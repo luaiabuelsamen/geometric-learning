@@ -1,142 +1,114 @@
-"""Perceiver-style point cloud autoencoder with SO(3)-structured latent.
+"""Vector-Neurons encoder + FoldingNet decoder.
 
-Encoder: 1024(or 512) input points -> embed -> cross-attend into K=32 learned
-latents -> N self-attention layers -> mean pool -> (z_content, z_pose=3x3 mat).
-
-Decoder: (z_content, z_pose) -> project to K latent tokens -> self-attention ->
-cross-attended by N learned point queries -> per-token linear -> 3D coordinates.
-
-Group action: R @ z_pose for the latent rotation; equivariance loss + cycle loss
-make the pose latent track the rotation of the input.
+Encoder is hard SO(3)-equivariant by construction — every layer commutes
+with rotation. Decoder explicitly factors out the rotation: it folds a
+fixed 2D grid into a canonical-frame point cloud conditioned on z_content,
+then applies z_pose as a final 3×3 matmul. So `dec(z_c, R @ z_p) =
+R @ dec(z_c, z_p)` is an architectural identity, not a soft loss.
 """
 import torch
 import torch.nn as nn
 
-
-class CrossAttnBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, mlp_ratio: int = 4):
-        super().__init__()
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio),
-            nn.GELU(),
-            nn.Linear(dim * mlp_ratio, dim),
-        )
-
-    def forward(self, q, kv):
-        a, _ = self.attn(self.norm_q(q), self.norm_kv(kv), self.norm_kv(kv), need_weights=False)
-        q = q + a
-        return q + self.mlp(self.norm2(q))
+from vn_layers import (
+    VNLinear,
+    VNLinearLeakyReLU,
+    VNStdFeature,
+    vn_mean_pool,
+)
 
 
-class SelfAttnBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, mlp_ratio: int = 4):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio),
-            nn.GELU(),
-            nn.Linear(dim * mlp_ratio, dim),
-        )
-
-    def forward(self, x):
-        x_n = self.norm1(x)
-        a, _ = self.attn(x_n, x_n, x_n, need_weights=False)
-        x = x + a
-        return x + self.mlp(self.norm2(x))
-
-
-class PointCloudEncoder(nn.Module):
-    def __init__(
-        self,
-        content_dim: int = 32,
-        dim: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 4,
-        n_latents: int = 32,
-    ):
+class VNEncoder(nn.Module):
+    def __init__(self, content_dim: int = 32, hidden: int = 64):
         super().__init__()
         self.content_dim = content_dim
-        self.point_embed = nn.Sequential(nn.Linear(3, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.latents = nn.Parameter(torch.zeros(1, n_latents, dim))
-        self.cross_attn = CrossAttnBlock(dim, n_heads)
-        self.self_attn = nn.ModuleList(
-            [SelfAttnBlock(dim, n_heads) for _ in range(n_layers)]
+        # Lift the 3D point (1 vector feature) to `hidden` vector features
+        self.lift = VNLinear(1, hidden)
+        self.conv1 = VNLinearLeakyReLU(hidden, hidden * 2)
+        self.conv2 = VNLinearLeakyReLU(hidden * 2, hidden * 2)
+        self.conv3 = VNLinearLeakyReLU(hidden * 2, hidden * 4)
+        # Heads
+        # Pose head: 3 vector features stacked as columns of a 3x3 matrix
+        self.pose_head = VNLinear(hidden * 4, 3)
+        # Content head: invariant scalars via learned frame projection
+        self.std_feature = VNStdFeature(hidden * 4, dim=3, normalize_frame=True)
+        self.content_head = nn.Sequential(
+            nn.Linear(hidden * 4 * 3, hidden * 4),
+            nn.GELU(),
+            nn.Linear(hidden * 4, content_dim),
         )
-        self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, content_dim + 9)
-        nn.init.trunc_normal_(self.latents, std=0.02)
 
     def forward(self, x: torch.Tensor):
-        # x: (B, N, 3)
-        B = x.size(0)
-        kv = self.point_embed(x)
-        q = self.latents.expand(B, -1, -1)
-        q = self.cross_attn(q, kv)
-        for blk in self.self_attn:
-            q = blk(q)
-        z = self.norm(q.mean(dim=1))
-        h = self.head(z)
-        z_content = h[:, : self.content_dim]
-        z_pose = h[:, self.content_dim :].view(B, 3, 3)
+        # x: (B, N, 3) -> z_content: (B, content_dim), z_pose: (B, 3, 3)
+        x_v = x.unsqueeze(-2)  # (B, N, 1, 3) — each point is one vector feature
+        h = self.lift(x_v)  # (B, N, hidden, 3)
+        h = self.conv1(h)
+        h = self.conv2(h)
+        h = self.conv3(h)
+        # Mean-pool over points (equivariant)
+        h_global = vn_mean_pool(h, dim=1)  # (B, hidden*4, 3)
+        # Pose: 3 vector features stacked as a matrix
+        z_pose = self.pose_head(h_global)  # (B, 3, 3) where each row is a vector feature
+        # Re-arrange so that z_pose acts as left-multiply: rows of z_pose ARE the
+        # 3 equivariant vectors that should rotate with the input. Use as columns
+        # of the rotation operator — i.e. transpose to put vectors in columns.
+        z_pose = z_pose.transpose(-1, -2)
+        # Content: invariant scalars
+        x_std, _ = self.std_feature(h_global)  # (B, C, 3) invariant
+        z_content = self.content_head(x_std.flatten(-2))
         return z_content, z_pose
 
 
-class PointCloudDecoder(nn.Module):
-    def __init__(
-        self,
-        content_dim: int = 32,
-        dim: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 4,
-        n_latents: int = 32,
-        n_points: int = 512,
-    ):
+class FoldingDecoder(nn.Module):
+    """FoldingNet-style decoder with explicit rotation factorization.
+
+    1. Fold a fixed 2D grid into a canonical-frame point cloud conditioned on z_content.
+    2. Apply z_pose @ x_canonical^T at the end.
+
+    This makes `dec(z_c, R @ z_p) = R @ dec(z_c, z_p)` an architectural identity.
+    """
+
+    def __init__(self, content_dim: int = 32, n_points_per_side: int = 23, hidden: int = 256):
         super().__init__()
-        self.dim = dim
-        self.n_latents = n_latents
-        self.n_points = n_points
-        self.input_proj = nn.Linear(content_dim + 9, n_latents * dim)
-        self.latent_pos = nn.Parameter(torch.zeros(1, n_latents, dim))
-        self.self_attn = nn.ModuleList(
-            [SelfAttnBlock(dim, n_heads) for _ in range(n_layers)]
+        n = n_points_per_side
+        self.n_grid = n * n
+        coords = torch.linspace(-1.0, 1.0, n)
+        gx, gy = torch.meshgrid(coords, coords, indexing="ij")
+        grid = torch.stack([gx.flatten(), gy.flatten()], dim=-1)  # (n_grid, 2)
+        self.register_buffer("grid", grid)
+
+        self.fold1 = nn.Sequential(
+            nn.Linear(content_dim + 2, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 3),
         )
-        self.queries = nn.Parameter(torch.zeros(1, n_points, dim))
-        self.cross_attn = CrossAttnBlock(dim, n_heads)
-        self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, 3)
-        nn.init.trunc_normal_(self.latent_pos, std=0.02)
-        nn.init.trunc_normal_(self.queries, std=0.02)
+        self.fold2 = nn.Sequential(
+            nn.Linear(content_dim + 3, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 3),
+        )
 
     def forward(self, z_content: torch.Tensor, z_pose: torch.Tensor) -> torch.Tensor:
         B = z_content.size(0)
-        z = torch.cat([z_content, z_pose.reshape(B, 9)], dim=-1)
-        latents = self.input_proj(z).view(B, self.n_latents, self.dim) + self.latent_pos
-        for blk in self.self_attn:
-            latents = blk(latents)
-        out = self.cross_attn(self.queries.expand(B, -1, -1), latents)
-        return self.head(self.norm(out))  # (B, n_points, 3)
+        n = self.n_grid
+        z_c_rep = z_content.unsqueeze(1).expand(B, n, -1)  # (B, n, content_dim)
+        grid = self.grid.unsqueeze(0).expand(B, -1, -1)  # (B, n, 2)
+        x1 = self.fold1(torch.cat([z_c_rep, grid], dim=-1))  # (B, n, 3) canonical
+        x2 = self.fold2(torch.cat([z_c_rep, x1], dim=-1))  # (B, n, 3) refined canonical
+        # Apply rotation: each point as a row, apply z_pose on the right
+        # so that p_rot = p @ z_pose.T
+        x_rotated = x2 @ z_pose.transpose(-1, -2)
+        return x_rotated
 
 
 def rotate_pose_matrix(z_pose: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """Group action on the pose latent: R @ M.
-
-    z_pose: (B, 3, 3), R: (B, 3, 3) -> (B, 3, 3).
-    Each column of M transforms as a 3D vector under R.
-    """
     return R @ z_pose
 
 
 def chamfer_distance(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """Symmetric Chamfer distance for unordered point sets.
-
-    p: (B, N, 3), q: (B, M, 3) -> scalar.
-    """
     diff = p.unsqueeze(2) - q.unsqueeze(1)
     d2 = (diff**2).sum(-1)
     p_to_q = d2.min(dim=2).values.mean(dim=1)

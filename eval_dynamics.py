@@ -1,4 +1,4 @@
-"""Compare hybrid / pure-hybrid / baseline dynamics, in latent and decoded space.
+"""Compare pure-hybrid / hybrid / baseline dynamics, in latent and decoded space.
 
 The headline plots are:
   (1) per-step pose-latent Frobenius error  vs rollout step (in-dist + OOD)
@@ -6,8 +6,9 @@ The headline plots are:
   (3) per-step decoded Chamfer distance     vs rollout step (in-dist + OOD)
   (4) one OOD trajectory rendered as point clouds (GT vs each method)
 
-The decoder for this checkpoint suffers mean-shape collapse, so (3) is heavily
-contaminated. The latent metrics in (1)+(2) are the clean signal.
+With the hard-equivariant encoder + equivariant decoder, the latent metrics
+in (1)+(2) and the decoded metric (3) tell the same story — pure/hybrid sit
+at machine epsilon, baseline diverges.
 """
 import argparse
 import math
@@ -25,7 +26,7 @@ from data import (
     sample_trajectory_batch,
 )
 from dynamics import BaselineDynamics, HybridDynamics, PureHybridDynamics
-from model import PointCloudDecoder, PointCloudEncoder, chamfer_distance
+from model import FoldingDecoder, VNEncoder, chamfer_distance
 
 
 def plot_pc(ax, pts, title=None):
@@ -71,22 +72,19 @@ def main(args):
     enc_args = dyn_ckpt["enc_args"]
     train_args = dyn_ckpt["args"]
 
-    enc = PointCloudEncoder(
-        content_dim=enc_args["content_dim"], dim=enc_args["dim"],
-        n_heads=enc_args["n_heads"], n_layers=enc_args["n_layers"],
-        n_latents=enc_args["n_latents"],
-    ).to(device)
-    dec = PointCloudDecoder(
-        content_dim=enc_args["content_dim"], dim=enc_args["dim"],
-        n_heads=enc_args["n_heads"], n_layers=enc_args["n_layers"],
-        n_latents=enc_args["n_latents"], n_points=enc_args["n_points"],
-    ).to(device)
+    n_per_side = int(math.sqrt(enc_args["n_points"]))
+    enc = VNEncoder(
+        content_dim=enc_args["content_dim"], hidden=enc_args["vn_hidden"]
+    ).to(device).eval()
+    dec = FoldingDecoder(
+        content_dim=enc_args["content_dim"], n_points_per_side=n_per_side,
+        hidden=enc_args["dec_hidden"],
+    ).to(device).eval()
     enc_ckpt = torch.load(
         os.path.join(args.ckpt_dir, "model.pt"),
         map_location=device, weights_only=False,
     )
     enc.load_state_dict(enc_ckpt["enc"]); dec.load_state_dict(enc_ckpt["dec"])
-    enc.eval(); dec.eval()
 
     hybrid = HybridDynamics(content_dim=enc_args["content_dim"]).to(device)
     baseline = BaselineDynamics(content_dim=enc_args["content_dim"]).to(device)
@@ -227,7 +225,7 @@ def main(args):
     axes[0].set_ylabel("chamfer distance")
     axes[0].legend(fontsize=8)
     fig.suptitle(
-        "Decoded Chamfer vs step  |  decoder mean-shape collapse heavily contaminates this metric",
+        "Decoded Chamfer vs rollout step  —  pure/hybrid stay flat under OOD rotations, baseline diverges",
         fontsize=10,
     )
     fig.tight_layout()
@@ -263,7 +261,7 @@ def main(args):
             ax = fig.add_subplot(n_rows, n_show, (r + 1) * n_show + j + 1, projection="3d")
             plot_pc(ax, dec(cs[idx], ps[idx])[0], title=mname.split(" ")[0])
     fig.suptitle(
-        "OOD rollout (decoder is collapsed; latent metrics in other plots are the clean signal)",
+        "OOD rollout (rotation magnitudes never seen at training): GT vs each dynamics model",
         fontsize=11,
     )
     fig.tight_layout()

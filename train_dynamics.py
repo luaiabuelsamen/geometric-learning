@@ -12,9 +12,11 @@ import time
 import torch
 from tqdm import tqdm
 
+import math
+
 from data import PointCloudDataset, list_modelnet10_paths, sample_trajectory_batch
 from dynamics import BaselineDynamics, HybridDynamics
-from model import PointCloudDecoder, PointCloudEncoder, chamfer_distance
+from model import FoldingDecoder, VNEncoder, chamfer_distance
 
 
 def prewarm(dataset: PointCloudDataset):
@@ -44,20 +46,12 @@ def train(args):
         weights_only=False,
     )
     saved = enc_ckpt["args"]
-    enc = PointCloudEncoder(
+    n_per_side = int(math.sqrt(saved["n_points"]))
+    enc = VNEncoder(content_dim=saved["content_dim"], hidden=saved["vn_hidden"]).to(device)
+    dec = FoldingDecoder(
         content_dim=saved["content_dim"],
-        dim=saved["dim"],
-        n_heads=saved["n_heads"],
-        n_layers=saved["n_layers"],
-        n_latents=saved["n_latents"],
-    ).to(device)
-    dec = PointCloudDecoder(
-        content_dim=saved["content_dim"],
-        dim=saved["dim"],
-        n_heads=saved["n_heads"],
-        n_layers=saved["n_layers"],
-        n_latents=saved["n_latents"],
-        n_points=saved["n_points"],
+        n_points_per_side=n_per_side,
+        hidden=saved["dec_hidden"],
     ).to(device)
     enc.load_state_dict(enc_ckpt["enc"])
     dec.load_state_dict(enc_ckpt["dec"])
