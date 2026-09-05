@@ -2,7 +2,7 @@
 
 A Vector-Neurons point-cloud autoencoder + a closed-form group-action latent-dynamics model. The core property — *rotation in input space corresponds to a known matrix multiply in latent space* — is enforced **architecturally**, not by a soft loss. That makes the latent dynamics extrapolate exactly to rotation magnitudes never seen during training, where standard learned latent dynamics fail by orders of magnitude.
 
-End-to-end on a Jetson Orin in under 30 minutes total.
+End-to-end on a Jetson Orin in about 90 minutes at default settings.
 
 ## What's enforced architecturally
 
@@ -13,7 +13,7 @@ End-to-end on a Jetson Orin in under 30 minutes total.
 | Decoder equivariance: `dec(z_c, R · z_p) = R · dec(z_c, z_p)` | FoldingNet decoder folds a 2D grid into a *canonical-frame* point cloud, then applies `z_pose` as a final 3×3 matmul |
 | Latent dynamics rigid update: `z_p_{t+1} = R(a_t) · z_p_t` | A literal matmul, zero learnable parameters |
 
-Measured equivariance error in `eval` mode: **2.1 × 10⁻⁵ mean / 1.7 × 10⁻⁴ max** (fp32), **3.5 × 10⁻¹⁰ in fp64**. Not a soft training target — these numbers are float-precision noise.
+Measured equivariance error in `eval` mode: **2.1 × 10⁻⁵ mean / 1.7 × 10⁻⁴ max** (fp32). Not a soft training target — these numbers are float-precision noise.
 
 ## Setup
 
@@ -34,11 +34,11 @@ python train_dynamics.py    # trains hybrid + baseline dynamics, writes ckpts/dy
 python eval_dynamics.py     # writes ckpts/dynamics_{pose_err,content_err,per_step,ood_visual}.png
 ```
 
-Defaults: 2000 steps autoencoder + 1500 steps dynamics, 800 ModelNet10 meshes, ~20 min total on a Jetson Orin.
+Defaults: 5000 steps autoencoder + 1500 steps dynamics, the ModelNet10 chair class, ~90 min total on a Jetson Orin.
 
 ## Dataset
 
-[ModelNet10](http://3dshapenets.cs.princeton.edu/) — 10 classes of CAD models (~4000 meshes). Each is sampled to 529 surface points (a 23×23 grid for FoldingNet), centered, and rescaled to the unit sphere. Rotations are exact `(3,3)` matrices applied to point coordinates.
+[ModelNet10](http://3dshapenets.cs.princeton.edu/) — 10 classes of CAD models (~4000 meshes). Each is sampled to 1024 surface points (a 32×32 grid for FoldingNet), centered, and rescaled to the unit sphere. Rotations are exact `(3,3)` matrices applied to point coordinates.
 
 | Sample objects (one per class) | Yaw rotation sweep |
 | --- | --- |
@@ -53,14 +53,14 @@ Defaults: 2000 steps autoencoder + 1500 steps dynamics, 800 ModelNet10 meshes, ~
 | Component | Variant | Params |
 |---|---|---|
 | Encoder | VN-PointNet (lift → 3 VN-conv → mean-pool → pose head + content head with VN-StdFeature) | 0.6M |
-| Decoder | FoldingNet (2-stage fold of fixed 23×23 grid → canonical points → applied rotation `z_pose`) | 0.4M |
+| Decoder | FoldingNet (2-stage fold of fixed 32×32 grid → canonical points → applied rotation `z_pose`) | 0.4M |
 | Hybrid dynamics | `R(a) @ z_pose` (closed form) + tiny MLP residual on `z_content` | ~13K |
 | Pure-hybrid dynamics | `R(a) @ z_pose` (closed form) only — zero learnable parameters | 0 |
 | Baseline dynamics | 3-layer MLP predicts deltas to both `z_content` and `z_pose` | ~140K |
 
 ## Autoencoder results
 
-After 5000 steps on chairs only (~90 min on Orin), pose equivariance error is **2 × 10⁻⁵ mean / 1 × 10⁻⁴ max** in fp32 inference, **3 × 10⁻¹⁰ in fp64** — machine epsilon.
+After 5000 steps on chairs only (~90 min on Orin), pose equivariance error is **2 × 10⁻⁵ mean / 1 × 10⁻⁴ max** in fp32 inference — float-precision noise.
 
 ### Canonicalization (no decoder involved)
 
@@ -104,7 +104,9 @@ Top: input rotated by θ. Mid: full encode→decode. Bottom: encode canonical in
 
 ### Pose latent error vs rollout step
 
-Pure and hybrid (overlapping) sit at the encoder's equivariance noise floor — **~10⁻⁸**. Baseline is **~6 orders of magnitude worse**, in both regimes.
+Pure and hybrid (overlapping) sit at the encoder's equivariance noise floor — **~10⁻⁸**. Baseline is **~6 orders of magnitude worse** (~10⁻²), in both regimes.
+
+> **Metric note.** `eval_dynamics.py` reports a *mean squared* Frobenius error, computed as `(pred - gt).pow(2).mean()`, which is what the plot axis labels `Frobenius^2`. So 10^-8 squared corresponds to roughly 10^-4 in absolute terms, and the 10^-2 baseline to roughly 10^-1. Do not quote one of these against an un-squared number.
 
 ![pose error](ckpts/dynamics_pose_err.png)
 
@@ -122,9 +124,9 @@ GT (top) shows real rotated chairs. Pure and hybrid produce consistently rotatin
 
 ### Findings
 
-1. **Architectural inductive bias gives exact OOD extrapolation.** Pure's pose error tracks the encoder's equivariance noise floor (10⁻⁸) regardless of rollout step or action magnitude.
+1. **Architectural inductive bias gives exact OOD extrapolation.** Pure's pose error tracks the encoder's equivariance noise floor (10⁻⁸, squared) regardless of rollout step or action magnitude.
 2. **Decoded metric and latent metric tell the same story** when the decoder is also equivariant. (In the soft-equivariant predecessor, decoder mean-shape collapse hid the result — that's no longer the case here.)
-3. **Standard learned latent dynamics (no group prior) is wildly off**, both in latent space (10⁻²) and decoded space (18× chamfer at step 8 OOD).
+3. **Standard learned latent dynamics (no group prior) is wildly off**, both in latent space (10⁻², squared) and decoded space (18× chamfer at step 8 OOD).
 
 The publishable claim:
 
